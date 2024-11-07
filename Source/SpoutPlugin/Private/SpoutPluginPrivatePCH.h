@@ -1,4 +1,5 @@
 // Some copyright should be here...
+#pragma once
 
 #include "SpoutModule.h"
 

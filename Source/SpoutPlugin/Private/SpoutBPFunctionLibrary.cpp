@@ -1,11 +1,13 @@
-#include "SpoutPluginPrivatePCH.h"
+
 #include "../Public/SpoutBPFunctionLibrary.h"
 
+#include "SpoutPluginPrivatePCH.h"
 #include <string>
 #include <iostream>
 #include <iomanip>
 #include <sstream>
 
+#include "Rendering/Texture2DResource.h"
 
 
 static ID3D11Device* g_D3D11Device;
@@ -420,7 +422,7 @@ bool USpoutBPFunctionLibrary::SpoutSender(FName spoutName, ESpoutSendTextureFrom
 			return false;
 		}
 		textureRenderTarget2D->TargetGamma = targetGamma;
-		baseTexture = (ID3D11Texture2D*)textureRenderTarget2D->Resource->TextureRHI->GetTexture2D()->GetNativeResource();
+		baseTexture = (ID3D11Texture2D*)textureRenderTarget2D->Resource->TextureRHI->GetNativeResource();
 		break;
 	default:
 		break;
