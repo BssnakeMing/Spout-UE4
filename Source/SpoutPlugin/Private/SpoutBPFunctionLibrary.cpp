@@ -7,10 +7,14 @@
 #include <iomanip>
 #include <sstream>
 
+#include <d3d11on12.h>
+#include <d3d11.h>
 #include "Rendering/Texture2DResource.h"
 
 
 static ID3D11Device* g_D3D11Device;
+ID3D11On12Device* g_D3D11on12Device = nullptr;
+
 ID3D11DeviceContext* g_pImmediateContext = NULL;
 
 spoutSenderNames * sender;
@@ -23,22 +27,19 @@ UMaterialInterface* BaseMaterial;
 
 FName TextureParameterName = "SpoutTexture";
 
-
-
-
 void DestroyTexture(UTexture2D*& Texture)
 {
 	// Here we destory the texture and its resource
 	if (Texture){
 		Texture->RemoveFromRoot();
 
-		if (Texture->Resource)
+		if (Texture->GetResource())
 		{
-			BeginReleaseResource(Texture->Resource);
+			BeginReleaseResource(Texture->GetResource());
 			FlushRenderingCommands();
 		}
 
-		Texture->MarkPendingKill();
+		Texture->MarkAsGarbage();
 		Texture = nullptr;
 	}else{
 		UE_LOG(SpoutLog, Warning, TEXT("Texture is ready"));
@@ -47,8 +48,6 @@ void DestroyTexture(UTexture2D*& Texture)
 
 void ResetMatInstance(UTexture2D*& Texture, UMaterialInstanceDynamic*& MaterialInstance)
 {
-
-
 	if (!Texture || !BaseMaterial || TextureParameterName.IsNone())
 	{
 		UE_LOG(SpoutLog, Warning, TEXT("UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU"));
@@ -95,7 +94,7 @@ void ResetTexture(UTexture2D*& Texture, UMaterialInstanceDynamic*& MaterialInsta
 	Texture->AddToRoot();
 	Texture->UpdateResource();
 	//UE_LOG(SpoutLog, Warning, TEXT("Texture is ready???????333333"));
-	SenderStruct->Texture2DResource = (FTexture2DResource*)Texture->Resource;
+	SenderStruct->Texture2DResource = (FTexture2DResource*)Texture->GetResource();
 
 	////////////////////////////////////////////////////////////////////////////////
 	ResetMatInstance(Texture, MaterialInstance);
@@ -132,9 +131,69 @@ void initSpout()
 void GetDevice()
 {
 	UE_LOG(SpoutLog, Warning, TEXT("-----------> Set Graphics Device D3D11"));
+	
+	const FString RHIName = GDynamicRHI->GetName();
+	if (USpoutBPFunctionLibrary::CheckDX11Version())
+	{
+		g_D3D11Device = (ID3D11Device*)GDynamicRHI->RHIGetNativeDevice();
+		g_D3D11Device->GetImmediateContext(&g_pImmediateContext);
+	}
+	else
+	{
+		ID3D12Device* Device12 = static_cast<ID3D12Device*>(GDynamicRHI->RHIGetNativeDevice());
+		UINT DeviceFlags11 = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
-	g_D3D11Device = (ID3D11Device*)GDynamicRHI->RHIGetNativeDevice();
-	g_D3D11Device->GetImmediateContext(&g_pImmediateContext);
+		verify(D3D11On12CreateDevice(
+			Device12,
+			DeviceFlags11,
+			nullptr,
+			0,
+			nullptr,
+			0,
+			0,
+			&g_D3D11Device,
+			&g_pImmediateContext,
+			nullptr
+		) == S_OK);
+
+		verify(g_D3D11Device->QueryInterface(__uuidof(ID3D11On12Device), (void**)&g_D3D11on12Device) == S_OK);
+	}
+}
+
+ID3D11Texture2D* GetD3D11Texture(const FTextureRHIRef& InTexture)
+{
+	if (!InTexture) return nullptr;
+
+	if (USpoutBPFunctionLibrary::CheckDX11Version())
+	{
+		return static_cast<ID3D11Texture2D*>(InTexture->GetNativeResource());
+	}
+	else
+	{
+		if (!g_D3D11on12Device) return nullptr;
+		ID3D12Resource* NativeTex = static_cast<ID3D12Resource*>(InTexture->GetNativeResource());
+		if (!NativeTex) return nullptr; // Handle potential null resource
+		
+		ID3D11Resource* WrappedDX11Resource = nullptr;
+		D3D11_RESOURCE_FLAGS Flags = {};
+		//Flags.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		//Flags.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+			
+		HRESULT hr = g_D3D11on12Device->CreateWrappedResource(
+			NativeTex,
+			&Flags,
+			D3D12_RESOURCE_STATE_COPY_DEST,
+			D3D12_RESOURCE_STATE_COPY_DEST, __uuidof(ID3D11Resource),
+			(void**)&WrappedDX11Resource) == S_OK;
+
+		if (FAILED(hr))
+		{
+			NativeTex->Release();
+			return nullptr;
+		}
+
+		return static_cast<ID3D11Texture2D*>(WrappedDX11Resource);
+	}
 }
 
 int32 USpoutBPFunctionLibrary::SetMaxSenders(int32 max){
@@ -212,14 +271,14 @@ FSenderStruct* RegisterReceiver(FName spoutName){
 
 	if (FAILED(openResult)) {
 		UE_LOG(SpoutLog, Error, TEXT("--FAIL--___Open Shared Resource___---"));
-		return false;
+		return nullptr;
 
 	}
 	UE_LOG(SpoutLog, Warning, TEXT("--starting...--___Create Shader Resource View___---"));
 	HRESULT createShaderResourceViewResult = g_D3D11Device->CreateShaderResourceView(newFSenderStruc->sharedResource, NULL, &newFSenderStruc->rView);
 	if (FAILED(createShaderResourceViewResult)) {
 		UE_LOG(SpoutLog, Error, TEXT("--FAIL--___Create Shader Resource View___---"));
-		return false;
+		return nullptr;
 
 	}
 
@@ -228,7 +287,7 @@ FSenderStruct* RegisterReceiver(FName spoutName){
 
 	if (tex == nullptr) {
 		UE_LOG(SpoutLog, Error, TEXT("---|||------||||----"));
-		return false;
+		return nullptr;
 	}
 	D3D11_TEXTURE2D_DESC description;
 	tex->GetDesc(&description);
@@ -262,7 +321,7 @@ FSenderStruct* RegisterReceiver(FName spoutName){
 			newFSenderStruc->texTemp = NULL;
 		}
 		UE_LOG(SpoutLog, Error, TEXT("Error creating temporal textura"));
-		return false;
+		return nullptr;
 
 	}
 	
@@ -396,7 +455,8 @@ ESpoutState CheckSenderState(FName spoutName){
 
 }
 
-bool USpoutBPFunctionLibrary::SpoutSender(FName spoutName, ESpoutSendTextureFrom sendTextureFrom, UTextureRenderTarget2D* textureRenderTarget2D, float targetGamma)
+bool USpoutBPFunctionLibrary::SpoutSender(FName spoutName, ESpoutSendTextureFrom sendTextureFrom, UTextureRenderTarget2D* textureRenderTarget2D, float
+                                          targetGamma, bool reverseAlpha)
 {
 	if (sender == nullptr)
 	{
@@ -408,27 +468,31 @@ bool USpoutBPFunctionLibrary::SpoutSender(FName spoutName, ESpoutSendTextureFrom
 		GetDevice();
 	}
 
-	ID3D11Texture2D* baseTexture = 0;
+	ID3D11Texture2D* baseTexture_Dx11 = 0;
+
 	FSenderStruct* SenderStruct = 0;
 	
 	switch (sendTextureFrom)
 	{
 	case ESpoutSendTextureFrom::GameViewport:
-		baseTexture = (ID3D11Texture2D*)GEngine->GameViewport->Viewport->GetRenderTargetTexture()->GetNativeResource();
+		//baseTexture_Dx11 = (ID3D11Texture2D*)GEngine->GameViewport->Viewport->GetRenderTargetTexture()->GetNativeResource();
+		baseTexture_Dx11 = GetD3D11Texture(GEngine->GameViewport->Viewport->GetRenderTargetTexture());
 		break;
 	case ESpoutSendTextureFrom::TextureRenderTarget2D:
 		if (textureRenderTarget2D == nullptr) {
 			UE_LOG(SpoutLog, Warning, TEXT("No TextureRenderTarget2D Selected!!"));
 			return false;
 		}
+		
 		textureRenderTarget2D->TargetGamma = targetGamma;
-		baseTexture = (ID3D11Texture2D*)textureRenderTarget2D->Resource->TextureRHI->GetNativeResource();
+		//baseTexture_Dx11 = (ID3D11Texture2D*)textureRenderTarget2D->GetResource()->TextureRHI->GetNativeResource();
+		baseTexture_Dx11 = GetD3D11Texture(textureRenderTarget2D->GetResource()->TextureRHI);
 		break;
 	default:
 		break;
 	}
 
-	if (baseTexture == nullptr) {
+	if (baseTexture_Dx11 == nullptr) {
 		UE_LOG(SpoutLog, Warning, TEXT("baseTexture is null"));
 		return false;
 	}
@@ -437,11 +501,11 @@ bool USpoutBPFunctionLibrary::SpoutSender(FName spoutName, ESpoutSendTextureFrom
 
 	if (state == ESpoutState::noEnoR || state == ESpoutState::noER) {
 		UE_LOG(SpoutLog, Warning, TEXT("Creating and registering new Sender..."));
-		CreateRegisterSender(spoutName, baseTexture);
+		CreateRegisterSender(spoutName, baseTexture_Dx11);
 		return false;
 	}
 	if (state == ESpoutState::EnoR) {
-		UE_LOG(SpoutLog, Warning, TEXT("A Sender with the name %s already exists"), *spoutName.GetPlainNameString());
+		//UE_LOG(SpoutLog, Warning, TEXT("A Sender with the name %s already exists"), *spoutName.GetPlainNameString());
 		return false;
 	}
 	if (state == ESpoutState::ER) {
@@ -449,10 +513,10 @@ bool USpoutBPFunctionLibrary::SpoutSender(FName spoutName, ESpoutSendTextureFrom
 		if (SenderStruct->spoutType == ESpoutType::Sender) {
 			// Check whether texture size has changed
 			D3D11_TEXTURE2D_DESC td;
-			baseTexture->GetDesc(&td);
+			baseTexture_Dx11->GetDesc(&td);
 			if (td.Width != SenderStruct->w || td.Height != SenderStruct->h) {
 				UE_LOG(SpoutLog, Warning, TEXT("Texture Size has changed, Updating registered spout: "), *spoutName.GetPlainNameString());
-				UpdateRegisteredSpout(spoutName, baseTexture);
+				UpdateRegisteredSpout(spoutName, baseTexture_Dx11);
 				return false;
 			}
 		}
@@ -479,31 +543,88 @@ bool USpoutBPFunctionLibrary::SpoutSender(FName spoutName, ESpoutSendTextureFrom
 		UE_LOG(SpoutLog, Warning, TEXT("targetTex is null"));
 		return false;
 	}
-	
-	ENQUEUE_RENDER_COMMAND(void)(
-		[targetTex, baseTexture](FRHICommandListImmediate& RHICmdList) {
-			g_pImmediateContext->CopyResource(targetTex, baseTexture);
-			g_pImmediateContext->Flush();
-		});
-	
+
+	if (reverseAlpha)
+	{
+		ENQUEUE_RENDER_COMMAND(SpoutSenderAlphaReverseCommand)(
+			[targetTex, baseTexture_Dx11](FRHICommandListImmediate& RHICmdList)
+			{
+				ID3D11DeviceContext* d3dContext = g_pImmediateContext;
+				ID3D11Texture2D* stagingTexture = nullptr;
+
+				// 1. 获取纹理描述并创建 Staging Texture
+				D3D11_TEXTURE2D_DESC desc;
+				baseTexture_Dx11->GetDesc(&desc);
+				desc.Usage = D3D11_USAGE_STAGING;
+				desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+				desc.BindFlags = 0;
+
+				if (FAILED(g_D3D11Device->CreateTexture2D(&desc, nullptr, &stagingTexture)))
+				{
+					UE_LOG(SpoutLog, Error, TEXT("Failed to create staging texture"));
+					return;
+				}
+
+				// 2. 复制 baseTexture -> stagingTexture
+				d3dContext->CopyResource(stagingTexture, baseTexture_Dx11);
+
+				// 3. 映射并处理 Alpha
+				D3D11_MAPPED_SUBRESOURCE mappedData;
+				if (SUCCEEDED(d3dContext->Map(stagingTexture, 0, D3D11_MAP_READ_WRITE, 0, &mappedData)))
+				{
+					uint8* pixels = static_cast<uint8*>(mappedData.pData);
+					const uint32 pixelSize = 4; // RGBA8 格式，每个像素占4字节
+
+					for (uint32 y = 0; y < desc.Height; y++)
+					{
+						for (uint32 x = 0; x < desc.Width; x++)
+						{
+							uint32 idx = y * mappedData.RowPitch + x * pixelSize;
+							uint8 r = pixels[idx + 0]; // R
+							uint8 g = pixels[idx + 1]; // G
+							uint8 b = pixels[idx + 2]; // B
+
+							// 如果颜色为黑色（R=0, G=0, B=0），将 Alpha 设置为 0
+							if (r == 0 && g == 0 && b == 0)
+							{
+								pixels[idx + 3] = 0; // 扣黑底
+							}
+						}
+					}
+					d3dContext->Unmap(stagingTexture, 0);
+				}
+
+				// 4. 将修改后的 stagingTexture 复制到 targetTex
+				d3dContext->CopyResource(targetTex, stagingTexture);
+				stagingTexture->Release();
+
+				// 5. 确保操作完成
+				d3dContext->Flush();
+			}
+		);
+	}
+	else
+	{
+		ENQUEUE_RENDER_COMMAND(void)(
+			[targetTex, baseTexture_Dx11](FRHICommandListImmediate& RHICmdList)
+			{
+				g_pImmediateContext->CopyResource(targetTex, baseTexture_Dx11);
+				g_pImmediateContext->Flush();
+			});
+	}
 	D3D11_TEXTURE2D_DESC td;
-	baseTexture->GetDesc(&td);
+	baseTexture_Dx11->GetDesc(&td);
 
 	result = sender->UpdateSender(TCHAR_TO_ANSI(*spoutName.ToString()), td.Width, td.Height, targetHandle);
 
 	return result;
 }
 
-bool USpoutBPFunctionLibrary::SpoutReceiver(const FName spoutName, UMaterialInstanceDynamic*& mat, UTexture2D*& texture)
-{
-	const FString SenderNameString = spoutName.GetPlainNameString();
+static bool bPendingUpdate = false;
 
-	if (BaseMaterial == NULL)
-	{
-		UMaterialInterface* mBase_Material = 0;
-		mBase_Material = LoadObject<UMaterial>(NULL, TEXT("/SpoutPlugin/Materials/SpoutMaterial.SpoutMaterial"), NULL, LOAD_None, NULL);
-		BaseMaterial = mBase_Material;
-	}
+bool USpoutBPFunctionLibrary::SpoutReceiver(const FName spoutName, UTexture2D*& texture)
+{
+	//const FString SenderNameString = spoutName.GetPlainNameString();
 	
 	if (sender == nullptr)
 	{ 
@@ -518,31 +639,31 @@ bool USpoutBPFunctionLibrary::SpoutReceiver(const FName spoutName, UMaterialInst
 	ESpoutState state = CheckSenderState(spoutName);
 
 	if (state == ESpoutState::noEnoR) {
-		UE_LOG(SpoutLog, Warning, TEXT("No sender found registered with the name %s"), *spoutName.GetPlainNameString());
-		UE_LOG(SpoutLog, Warning, TEXT("Try to rename it, or resend %s"), *SenderNameString);
+		/*UE_LOG(SpoutLog, Warning, TEXT("No sender found registered with the name %s"), *spoutName.GetPlainNameString());
+		UE_LOG(SpoutLog, Warning, TEXT("Try to rename it, or resend %s"), *SenderNameString);*/
 		return false;
 	}
 		
 	if(state == ESpoutState::noER) {
-		UE_LOG(SpoutLog, Warning, TEXT("Why are you registered??, unregister, best to close it"));
+		//UE_LOG(SpoutLog, Warning, TEXT("Why are you registered??, unregister, best to close it"));
 		//UnregisterSpout(spoutName);
 		CloseSender(spoutName);
 		return false;
 	}
 
 	if (state == ESpoutState::EnoR) {
-		UE_LOG(SpoutLog, Warning, TEXT("Sender %s found, registering, receiving..."), *spoutName.GetPlainNameString());
+		//UE_LOG(SpoutLog, Warning, TEXT("Sender %s found, registering, receiving..."), *spoutName.GetPlainNameString());
 		RegisterReceiver(spoutName);
 		return false;
 	}
 
 	if (state == ESpoutState::ER) {
-		FSenderStruct* SenderStruct = 0;
-		GetSpoutRegistred(spoutName, SenderStruct);
-		
-		if (SenderStruct->spoutType == ESpoutType::Sender) {
-			//UE_LOG(SpoutLog, Warning, TEXT("Receiving from sender inside ue4 with the name %s"), *spoutName.GetPlainNameString());
+		if (bPendingUpdate)
+		{
+			return true;
 		}
+		FSenderStruct* SenderStruct = nullptr;
+		GetSpoutRegistred(spoutName, SenderStruct);
 
 		if (SenderStruct->spoutType == ESpoutType::Receiver) {
 			//UE_LOG(SpoutLog, Warning, TEXT("Continue Receiver with the name %s"), *SenderName.GetPlainNameString());
@@ -551,12 +672,14 @@ bool USpoutBPFunctionLibrary::SpoutReceiver(const FName spoutName, UMaterialInst
 			// copy pixels from shared resource texture to texture temporal and update 
 			int32 Stride = SenderStruct->w * 4;
 
+			bPendingUpdate = true;
+
 			ENQUEUE_RENDER_COMMAND(void)(
 				[SenderStruct, Stride](FRHICommandListImmediate& RHICmdList)
 				{
 					ID3D11Texture2D* t_texTemp = SenderStruct->texTemp;
 					ID3D11Texture2D* t_tex = (ID3D11Texture2D*)SenderStruct->sharedResource;
-
+										
 					if (SenderStruct == nullptr) {
 						return;
 					}
@@ -585,12 +708,12 @@ bool USpoutBPFunctionLibrary::SpoutReceiver(const FName spoutName, UMaterialInst
 						mapped.RowPitch,
 						(uint8*)pixel
 					);
-
-
+					
+					bPendingUpdate = false;
 				});
 
 			texture = SenderStruct->TextureColor;
-			mat = SenderStruct->MaterialInstanceColor;
+			//mat = SenderStruct->MaterialInstanceColor;
 		}
 	}
 	
@@ -719,4 +842,11 @@ bool USpoutBPFunctionLibrary::UpdateRegisteredSpout(FName spoutName, ID3D11Textu
 	}
 
 	return senderResult;
+}
+
+bool USpoutBPFunctionLibrary::CheckDX11Version()
+{
+	// 检查DX版本
+	const FString RHIName = GDynamicRHI->GetName();
+	return RHIName == TEXT("D3D11");
 }
